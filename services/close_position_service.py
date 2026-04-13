@@ -37,7 +37,6 @@ def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dic
         del analyzer_request["apikey"]
     analyzer_request["api_type"] = API_TYPE
 
-    # Publish analyzer error to the event bus
     bus.publish(AnalyzerErrorEvent(
         mode="analyze", api_type=API_TYPE,
         request_data=analyzer_request, response_data=error_response,
@@ -70,7 +69,7 @@ def close_position_with_auth(
     position_data: dict[str, Any], auth_token: str, broker: str, original_data: dict[str, Any]
 ) -> tuple[bool, dict[str, Any], int]:
     """
-    Close all positions using provided auth token with Freeze Quantity Splitting.
+    Close all positions using provided auth token.
 
     Args:
         position_data: Position data
@@ -113,7 +112,6 @@ def close_position_with_auth(
 
         success, response, status_code = sandbox_close_position(close_data, api_key, original_data)
 
-        # Publish sandbox event to the bus
         position_request_data["api_type"] = API_TYPE
         bus.publish(PositionClosedEvent(
             mode="analyze", api_type=API_TYPE,
@@ -149,11 +147,19 @@ def close_position_with_auth(
             response_data = {"status": "success", "message": "No Open Positions Found"}
             return True, response_data, 200
 
+        # Track any symbols that fail to close to avoid swallowing errors (Bot Violation 3)
+        failed_symbols = []
+
         # Loop through each position to close with Freeze Quantity Splitting
         for position in positions_response["data"]:
             # Handle different field names for quantity across brokers
-            raw_qty = position.get("netqty") or position.get("quantity") or 0
-            net_qty = int(raw_qty)
+            try:
+                # Wrap quantity conversion in try-except for schema safety (Bot Violation 1)
+                raw_qty = position.get("netqty") or position.get("quantity") or 0
+                net_qty = int(raw_qty)
+            except (ValueError, TypeError):
+                logger.warning(f"Skipping position with invalid quantity: {raw_qty} | position={position}")
+                continue
             
             if net_qty == 0:
                 continue
@@ -163,10 +169,11 @@ def close_position_with_auth(
             total_quantity = abs(net_qty)
             
             # Map broker token to OpenAlgo symbol to fetch freeze limit
+            # Supports 'symboltoken' (Angel) or 'token' (others)
             token = position.get("symboltoken") or position.get("token") or position.get("instrument_token")
             symbol = get_symbol(token, position["exchange"])
             
-            # Look up the freeze quantity for the symbol/exchange from the database
+            # Look up the freeze quantity for the symbol/exchange
             freeze_limit = get_freeze_qty(symbol, position["exchange"])
             
             # If no limit is found, default to the full quantity
@@ -178,7 +185,7 @@ def close_position_with_auth(
             while remaining_qty > 0:
                 current_order_qty = min(remaining_qty, freeze_limit)
                 
-                # Payload using broker's internal product mapper
+                # Prepare the order payload for the broker's place_order_api
                 split_payload = {
                     "apikey": position_data.get("apikey", ""),
                     "strategy": "Squareoff_Split",
@@ -197,6 +204,7 @@ def close_position_with_auth(
                 
                 if not orderid:
                     logger.error(f"Failed to place split order for {symbol}: {response}")
+                    failed_symbols.append(symbol)
                     break # Stop further splits for this symbol on failure
 
                 remaining_qty -= current_order_qty
@@ -205,8 +213,29 @@ def close_position_with_auth(
                 if remaining_qty > 0:
                     time.sleep(0.2)
 
-        status_code = 200
-        response_data = {"status": "success", "message": "All Open Positions Squared Off"}
+        # Handle overall response based on whether any split orders failed (Bot Violation 2 & 3)
+        if failed_symbols:
+            status_msg = f"Completed with errors. Failed to close: {', '.join(failed_symbols)}"
+            response_data = {"status": "partial_error", "message": status_msg}
+            # Return False to indicate the operation was not fully successful
+            success_status = False
+            status_code = 207 # Multi-Status
+        else:
+            response_data = {"status": "success", "message": "All Open Positions Squared Off"}
+            success_status = True
+            status_code = 200
+
+        # Publish the outcome to the event bus
+        bus.publish(PositionClosedEvent(
+            mode="live", api_type=API_TYPE,
+            symbol="ALL", exchange="ALL",
+            product="ALL",
+            orderid="", message=response_data["message"],
+            request_data=position_request_data, response_data=response_data,
+            api_key=original_data.get("apikey", ""),
+        ))
+        
+        return success_status, response_data, status_code
 
     except Exception as e:
         logger.error(f"Error in centralized close_all_positions logic: {e}")
@@ -225,32 +254,6 @@ def close_position_with_auth(
         ))
         return False, error_response, 500
 
-    if status_code == 200:
-        # Publish success event
-        bus.publish(PositionClosedEvent(
-            mode="live", api_type=API_TYPE,
-            symbol=position_data.get("symbol", ""), exchange=position_data.get("exchange", ""),
-            product=position_data.get("product_type", "") or position_data.get("product", ""),
-            orderid="", message="All Open Positions Squared Off",
-            request_data=position_request_data, response_data=response_data,
-            api_key=original_data.get("apikey", ""),
-        ))
-        return True, response_data, 200
-    else:
-        # Fallback error handling
-        err_msg = response_data.get("message", "Failed to close positions") if isinstance(response_data, dict) else "Failed to close positions"
-        error_response = {"status": "error", "message": err_msg}
-        
-        bus.publish(PositionClosedEvent(
-            mode="live", api_type=API_TYPE,
-            symbol=position_data.get("symbol", ""), exchange=position_data.get("exchange", ""),
-            product=position_data.get("product_type", "") or position_data.get("product", ""),
-            orderid="", message=err_msg,
-            request_data=position_request_data, response_data=error_response,
-            api_key=original_data.get("apikey", ""),
-        ))
-        return False, error_response, status_code
-
 
 def close_position(
     position_data: dict[str, Any] = None,
@@ -261,6 +264,18 @@ def close_position(
     """
     Close all open positions.
     Supports both API-based authentication and direct internal calls.
+
+    Args:
+        position_data: Position data (optional, may contain additional parameters)
+        api_key: OpenAlgo API key (for API-based calls)
+        auth_token: Direct broker authentication token (for internal calls)
+        broker: Direct broker name (for internal calls)
+
+    Returns:
+        Tuple containing:
+        - Success status (bool)
+        - Response data (dict)
+        - HTTP status code (int)
     """
     if position_data is None:
         position_data = {}
@@ -271,8 +286,11 @@ def close_position(
 
     # Case 1: API-based authentication
     if api_key and not (auth_token and broker):
+        # Check if user is in semi-auto mode (closeposition is blocked in semi-auto)
+        # BUT allow execution in analyze/sandbox mode (virtual trading should always work)
         from database.auth_db import get_order_mode, verify_api_key
 
+        # Check analyze mode first - if in analyze mode, allow execution
         if not get_analyze_mode():
             user_id = verify_api_key(api_key)
             if user_id:
@@ -283,18 +301,15 @@ def close_position(
                         "message": "Close position operation is not allowed in Semi-Auto mode. Please switch to Auto mode to close positions.",
                     }
                     logger.warning(f"Close position blocked for user {user_id} (semi-auto mode)")
-                    
-                    # Prepare data for blocking event
-                    temp_request_data = copy.deepcopy(original_data)
-                    if "apikey" in temp_request_data:
-                        temp_request_data.pop("apikey", None)
-                        
+                    position_request_data = copy.deepcopy(original_data)
+                    if "apikey" in position_request_data:
+                        position_request_data.pop("apikey", None)
                     bus.publish(PositionClosedEvent(
                         mode="live", api_type=API_TYPE,
                         symbol=position_data.get("symbol", ""), exchange=position_data.get("exchange", ""),
                         product=position_data.get("product_type", "") or position_data.get("product", ""),
                         orderid="", message=error_response["message"],
-                        request_data=temp_request_data, response_data=error_response,
+                        request_data=position_request_data, response_data=error_response,
                         api_key=api_key,
                     ))
                     return False, error_response, 403
@@ -304,13 +319,20 @@ def close_position(
 
         AUTH_TOKEN, broker_name = get_auth_token_broker(api_key)
         if AUTH_TOKEN is None:
-            return False, {"status": "error", "message": "Invalid openalgo apikey"}, 403
+            error_response = {"status": "error", "message": "Invalid openalgo apikey"}
+            # Skip logging for invalid API keys to prevent database flooding
+            return False, error_response, 403
 
         return close_position_with_auth(position_data, AUTH_TOKEN, broker_name, original_data)
 
-    # Case 2: Direct internal call
+    # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
         return close_position_with_auth(position_data, auth_token, broker, original_data)
 
+    # Case 3: Invalid parameters
     else:
-        return False, {"status": "error", "message": "Invalid parameters"}, 400
+        error_response = {
+            "status": "error",
+            "message": "Either api_key or both auth_token and broker must be provided",
+        }
+        return False, error_response, 400
